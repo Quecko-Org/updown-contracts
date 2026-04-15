@@ -9,6 +9,7 @@ node_modules/
 # Foundry build output
 out/
 cache/
+lib/
 
 # Hardhat build output
 cache_hardhat/
