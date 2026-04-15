@@ -1,0 +1,21 @@
+{
+  "name": "updown-contracts",
+  "version": "1.0.0",
+  "scripts": {
+    "compile": "hardhat compile",
+    "deploy:local": "hardhat run scripts/deploy.js",
+    "deploy:arbitrum": "hardhat run scripts/deploy.js --network arbitrum",
+    "fund:arbitrum": "hardhat run scripts/fund.js --network arbitrum",
+    "post-deploy:arbitrum": "hardhat run scripts/post-deploy.js --network arbitrum",
+    "mint:usdt": "hardhat run scripts/mint-dev-usdt.js --network arbitrum",
+    "node": "hardhat node"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-ethers": "^3.0.8",
+    "@nomicfoundation/hardhat-foundry": "^1.1.3",
+    "@nomicfoundation/hardhat-verify": "^2.0.0",
+    "dotenv": "^16.4.7",
+    "ethers": "^6.13.5",
+    "hardhat": "^2.22.19"
+  }
+}

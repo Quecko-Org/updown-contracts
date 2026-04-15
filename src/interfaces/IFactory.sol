@@ -13,7 +13,7 @@ interface IFactory {
         uint256 startTime;
         uint256 endTime;
         uint256 numberOfOptions;
-        uint256 oracleEndTime; // dispute duration in seconds (NOT absolute timestamp)
+        uint256 oracleEndTime; // relative duration in seconds after endTime (e.g. 600 = 10 min)
         string ipfsUri;
         uint256 initialLiquidity; // seed USDT in wei — factory requires non-zero
         uint256[] liquidityPercentages; // basis points, must sum to 10000

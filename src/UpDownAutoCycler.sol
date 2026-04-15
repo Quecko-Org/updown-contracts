@@ -207,18 +207,20 @@ contract UpDownAutoCycler is Ownable {
         int256 strike = resolver.getPrice(pairId);
 
         uint256 end = block.timestamp + tf.duration;
-        uint256[] memory liqPct = new uint256[](2);
-        liqPct[0] = 5000;
+        // RAIN UpDown markets use 3 options: Up (49%), Down (50%), Draw/Cancel (1%)
+        uint256[] memory liqPct = new uint256[](3);
+        liqPct[0] = 4900;
         liqPct[1] = 5000;
+        liqPct[2] = 100;
 
         IFactory.Params memory params = IFactory.Params({
             isPublic: false,
             resolverIsAI: false,
             poolOwner: address(this),
             referrer: address(0),
-            startTime: block.timestamp,
+            startTime: block.timestamp + 1,
             endTime: end,
-            numberOfOptions: 2,
+            numberOfOptions: 3,
             oracleEndTime: tf.disputeDuration,
             ipfsUri: "",
             initialLiquidity: seedLiquidity,
