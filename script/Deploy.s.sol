@@ -13,10 +13,15 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 ///   forge script script/Deploy.s.sol --rpc-url $ARBITRUM_RPC_URL --broadcast --verify
 ///
 /// Required env vars:
-///   DEPLOYER_PRIVATE_KEY  — the deployer/owner key
-///   ARBITRUM_RPC_URL      — Arbitrum One RPC
-///   USDT_ADDRESS          — USDT token on the target network
-///   RELAYER_ADDRESS       — relayer wallet that calls enterPosition / withdrawSettlement
+///   DEPLOYER_PRIVATE_KEY            — the deployer/owner key
+///   ARBITRUM_RPC_URL                — Arbitrum One RPC
+///   USDT_ADDRESS                    — USDT token on the target network
+///   RELAYER_ADDRESS                 — relayer wallet that calls enterPosition / withdrawSettlement
+///   TREASURY_ADDRESS                — treasury EOA that receives platformFee + funds rebate claims
+///   CHAINLINK_VERIFIER_PROXY_ADDRESS — Data Streams VerifierProxy on the target network
+///                                     (Arbitrum Sepolia testnet: 0x2ff010DEbC1297f19579B4246cad07bd24F2488A)
+///   CHAINLINK_LINK_TOKEN_ADDRESS    — LINK token address on the target network
+///                                     (Arbitrum One: 0xf97f4df75117a78c1A5a0DBb814Af92458539FB4)
 contract DeployUpDown is Script {
     // ── Chainlink addresses (Arbitrum Mainnet) ──────────────────────────
     address constant CHAINLINK_BTC_USD = 0x6ce185860a4963106506C203335A2910413708e9;
@@ -39,6 +44,12 @@ contract DeployUpDown is Script {
         // PR-5-bundle (P0-7): treasury must be configured pre-broadcast or
         // any fill with platformFee > 0 reverts on TreasuryNotConfigured.
         address treasury = vm.envAddress("TREASURY_ADDRESS");
+        // 2026-05-13 Data Streams swap: resolver constructor now also
+        // takes the VerifierProxy + LINK token addresses. Both must be
+        // env-supplied to avoid hardcoding per-network values in the
+        // script. On Arbitrum One, LINK = 0xf97f4df75117a78c1A5a0DBb814Af92458539FB4.
+        address verifierProxy = vm.envAddress("CHAINLINK_VERIFIER_PROXY_ADDRESS");
+        address linkToken = vm.envAddress("CHAINLINK_LINK_TOKEN_ADDRESS");
 
         console.log("Deployer:", deployer);
         console.log("USDT:", usdt);
@@ -52,9 +63,21 @@ contract DeployUpDown is Script {
         console.log("UpDownSettlement:", address(settlement));
 
         ChainlinkResolver resolver = new ChainlinkResolver(
-            deployer, CHAINLINK_SEQUENCER, BTCUSD, CHAINLINK_BTC_USD, ETHUSD, CHAINLINK_ETH_USD, address(settlement)
+            deployer,
+            CHAINLINK_SEQUENCER,
+            BTCUSD,
+            CHAINLINK_BTC_USD,
+            ETHUSD,
+            CHAINLINK_ETH_USD,
+            address(settlement),
+            verifierProxy,
+            linkToken
         );
         console.log("ChainlinkResolver:", address(resolver));
+        // Post-deploy ops: ops must (a) `configureStreamsFeed(pairId, feedId)`
+        // for each pair once the DON allow-lists this resolver address,
+        // and (b) topup the resolver with LINK for verify fees (default
+        // floor 5 LINK per the OPS_RUNBOOK).
 
         UpDownAutoCycler cycler = new UpDownAutoCycler(deployer, address(resolver), address(settlement));
         console.log("UpDownAutoCycler:", address(cycler));

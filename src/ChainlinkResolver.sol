@@ -2,15 +2,38 @@
 pragma solidity ^0.8.29;
 
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+
 import {AggregatorV3Interface} from "./interfaces/AggregatorV3Interface.sol";
 import {IUpDownSettlement} from "./interfaces/IUpDownSettlement.sol";
+import {IVerifierProxy, IFeeManager, FeeManagerAsset, ReportV3} from "./interfaces/IVerifierProxy.sol";
 
 /// @title ChainlinkResolver
-/// @notice Reads Chainlink price feeds on Arbitrum, validates the L2 sequencer,
-///         and resolves UpDown markets via `UpDownSettlement.resolve`.
-///         Resolution is permissionless — anyone can call `resolve` since the
-///         outcome is deterministic from the Chainlink feed (UP if price > strike, else DOWN; tie => DOWN).
+/// @notice Reads Chainlink price data and resolves UpDown markets via
+///         `UpDownSettlement.resolve`. Resolution is permissionless — anyone
+///         can submit a valid Data Streams report and the outcome is
+///         deterministic (UP if price > strike, else DOWN; tie => DOWN).
+///
+///         Price sources after the 2026-05-13 Data Streams swap:
+///         - **Strike at create-time** (`getPrice` / `_getLatestPrice`):
+///           Chainlink Data Feeds via `AggregatorV3Interface` (legacy
+///           push-based aggregator). Strike is a fixed bet anchor and
+///           1-hour staleness tolerance is acceptable.
+///         - **Settlement at resolve-time** (`resolve`): Chainlink Data
+///           Streams via `IVerifierProxy.verify` (pull-based, sub-second
+///           freshness). Submitted as a signed `ReportV3` blob fetched
+///           off-chain from the Data Streams REST API and verified +
+///           paid for on-chain. See `audit-fixes/DATA_STREAMS_INVESTIGATION.md`.
+///
+///         LINK fee model is Option A from the design pre-discussion
+///         (gate-approved 2026-05-13): the resolver holds its own LINK
+///         balance, ops tops up via direct transfer, owner clawback via
+///         `withdrawLink`. Separate trust boundary from the rebate
+///         rebuild's treasury approval pattern (which lives on USDT).
 contract ChainlinkResolver is Ownable {
+    using SafeERC20 for IERC20;
+
     // ── Errors ──────────────────────────────────────────────────────────
     error FeedNotConfigured();
     error SequencerDown();
@@ -21,23 +44,45 @@ contract ChainlinkResolver is Ownable {
     error AlreadyResolved();
     error TrustedSettlementMismatch();
     error ZeroTrustedSettlement();
-    /// @notice PR-10 (P0-16): the supplied `roundId`'s `updatedAt` is AFTER
-    ///         `market.endTime` — i.e. the caller picked a round that postdates
-    ///         the market window. The canonical round for this market is the
-    ///         latest round whose `updatedAt <= endTime`.
-    error RoundTooLate();
-    /// @notice PR-10 (P0-16): the supplied `roundId` is valid (`updatedAt <=
-    ///         endTime`) but the *next* round's `updatedAt` is also `<=
-    ///         endTime` — meaning the caller picked an earlier round, not the
-    ///         last one before endTime. Forces the resolution price to the
-    ///         single deterministic round per market.
-    error NotLastPreEndTimeRound();
+    error ZeroAddress();
+    /// @notice Streams swap (2026-05-13): caller submitted a report for a
+    ///         pair that has no streams feed-id configured. Configure via
+    ///         `configureStreamsFeed(pairId, feedId)` before any market
+    ///         in that pair can resolve.
+    error StreamsFeedNotConfigured();
+    /// @notice Streams swap: report's `feedId` does not match the
+    ///         `streamsFeedId` registered for the market's pair. Off-chain
+    ///         caller fetched a report for the wrong stream — the
+    ///         resolver refuses to use it.
+    error ReportFeedIdMismatch(bytes32 want, bytes32 have);
+    /// @notice Streams swap: report's `expiresAt` is in the past. The
+    ///         Verifier Proxy itself would also reject, but we check
+    ///         pre-call to fail loudly with a typed error before
+    ///         attempting the fee approval.
+    error ReportExpired(uint256 expiresAt, uint256 nowTs);
+    /// @notice Streams swap: report's `observationsTimestamp` is outside
+    ///         the window `[endTime - MAX_REPORT_OBSERVATION_LAG, endTime]`.
+    ///         Either too old (DON observed before our market window
+    ///         opened — pre-PR-Streams Data Feeds equivalent of
+    ///         `updatedAt < endTime - MAX_STALENESS`) or in the future
+    ///         (DON observed AFTER the market closed — would reflect a
+    ///         post-close price). The resolver refuses to resolve on a
+    ///         report observed outside the bracket.
+    error ReportObservationOutOfWindow(uint256 endTime, uint256 observationsTimestamp);
 
     // ── Events ──────────────────────────────────────────────────────────
     event FeedConfigured(bytes32 indexed pairId, address feed);
     event MarketRegistered(uint256 indexed marketId, address indexed settlement, bytes32 indexed pairId, int256 strikePrice);
     event MarketResolved(uint256 indexed marketId, uint256 winningOption, int256 settlementPrice, int256 strikePrice);
     event AuthorizedCallerSet(address indexed caller, bool authorized);
+    /// @notice Streams swap: emitted on `configureStreamsFeed`. Off-chain
+    ///         indexers track per-pair stream-id assignments for ops
+    ///         monitoring and the `ChainlinkResolverService` config
+    ///         reconciliation.
+    event StreamsFeedConfigured(bytes32 indexed pairId, bytes32 feedId);
+    /// @notice Streams swap: emitted on `withdrawLink`. Owner clawback
+    ///         + rotation audit trail.
+    event LinkWithdrawn(address indexed to, uint256 amount);
     /// @notice PR-16 (P1-18): emitted when the inner `IUpDownSettlement.resolve`
     ///         call reverts. Pre-fix the revert was swallowed silently, so a
     ///         broken settlement contract or a stuck market produced no
@@ -55,7 +100,20 @@ contract ChainlinkResolver is Ownable {
     }
 
     // ── Constants ───────────────────────────────────────────────────────
+    /// @notice Strike-side (Data Feeds) staleness window. Still 1 hour;
+    ///         the strike is a fixed bet anchor and a slightly-stale
+    ///         spot reference is acceptable for it (see investigation).
     uint256 public constant MAX_STALENESS = 1 hours;
+    /// @notice Streams swap: tolerance on `report.observationsTimestamp`
+    ///         vs `market.endTime`. The DON publishes Crypto-stream
+    ///         reports at sub-second cadence, so under normal conditions
+    ///         the off-chain helper can fetch a report within 1 second
+    ///         of `endTime`. The 30-second window absorbs API hiccups
+    ///         without ever pricing a market on a stale observation.
+    ///         Asymmetric: lower-bounded only — the report must NOT be
+    ///         observed AFTER `endTime` (that would price the market on
+    ///         a post-close snapshot).
+    uint256 public constant MAX_REPORT_OBSERVATION_LAG = 30 seconds;
     uint256 public constant SEQUENCER_GRACE_PERIOD = 1 hours;
     uint256 public constant OPTION_UP = 1;
     uint256 public constant OPTION_DOWN = 2;
@@ -64,11 +122,41 @@ contract ChainlinkResolver is Ownable {
     AggregatorV3Interface public immutable sequencerFeed;
     address public immutable trustedSettlement;
 
+    /// @notice Streams swap: Chainlink-deployed Verifier Proxy that
+    ///         validates DON signatures + collects the per-report LINK
+    ///         fee. Immutable — rotation would require a fresh resolver
+    ///         deploy (same posture as `trustedSettlement`). The proxy
+    ///         is part of Chainlink's protocol infrastructure, not our
+    ///         deploy, so we trust the address operationally.
+    IVerifierProxy public immutable verifierProxy;
+
+    /// @notice Streams swap: LINK token address on the host chain.
+    ///         Resolver holds its own LINK balance and pays the per-verify
+    ///         fee from it (Option A funding model). Ops tops up by
+    ///         sending LINK directly to this contract; clawback /
+    ///         rotation via `withdrawLink`. Immutable for same reason as
+    ///         `verifierProxy` — a LINK rotation in the wider Chainlink
+    ///         ecosystem is a redeploy event for every consumer.
+    IERC20 public immutable linkToken;
+
+    /// @notice Streams swap: per-pair Data Streams feed-id. Separate
+    ///         from `priceFeeds` (Data Feeds aggregator addresses,
+    ///         used for the strike path). Set by `configureStreamsFeed`.
+    mapping(bytes32 => bytes32) public streamsFeedId;
+
     mapping(bytes32 => address) public priceFeeds;
     mapping(uint256 => MarketInfo) public markets;
     mapping(address => bool) public authorizedCallers;
 
     // ── Constructor ─────────────────────────────────────────────────────
+    /// @notice Constructor now takes the Streams Verifier Proxy + LINK
+    ///         token addresses alongside the strike-side Data Feeds
+    ///         aggregator addresses. The Streams feed-ids are set
+    ///         post-deploy via `configureStreamsFeed` — leaving them out
+    ///         of the constructor keeps the signature manageable and
+    ///         matches Chainlink's recommended deployment pattern
+    ///         (configure each stream-id after the contract address is
+    ///         known so it can be allow-listed at the DON side first).
     constructor(
         address _owner,
         address _sequencerFeed,
@@ -76,11 +164,16 @@ contract ChainlinkResolver is Ownable {
         address _btcUsdFeed,
         bytes32 _ethUsdPairId,
         address _ethUsdFeed,
-        address _trustedSettlement
+        address _trustedSettlement,
+        address _verifierProxy,
+        address _linkToken
     ) Ownable(_owner) {
         if (_trustedSettlement == address(0)) revert ZeroTrustedSettlement();
+        if (_verifierProxy == address(0) || _linkToken == address(0)) revert ZeroAddress();
         trustedSettlement = _trustedSettlement;
         sequencerFeed = AggregatorV3Interface(_sequencerFeed);
+        verifierProxy = IVerifierProxy(_verifierProxy);
+        linkToken = IERC20(_linkToken);
 
         priceFeeds[_btcUsdPairId] = _btcUsdFeed;
         emit FeedConfigured(_btcUsdPairId, _btcUsdFeed);
@@ -95,6 +188,30 @@ contract ChainlinkResolver is Ownable {
     function configureFeed(bytes32 pairId, address feed) external onlyOwner {
         priceFeeds[pairId] = feed;
         emit FeedConfigured(pairId, feed);
+    }
+
+    /// @notice Streams swap (2026-05-13): set the Data Streams feed-id
+    ///         for a pair. Called once per supported pair after the
+    ///         DON has allow-listed this contract for the corresponding
+    ///         stream. Markets created for a pair with an unconfigured
+    ///         streams feed-id can still be REGISTERED (the registration
+    ///         path only consults `priceFeeds` for strike validity) but
+    ///         will fail to RESOLVE with `StreamsFeedNotConfigured()`
+    ///         until this is set — loud failure mode, not silent.
+    function configureStreamsFeed(bytes32 pairId, bytes32 feedId) external onlyOwner {
+        streamsFeedId[pairId] = feedId;
+        emit StreamsFeedConfigured(pairId, feedId);
+    }
+
+    /// @notice Streams swap: owner clawback of LINK held by this contract.
+    ///         Used for rotation (migrate funding to a new resolver),
+    ///         emergency recovery, or pre-deprecation drainage. NOT a
+    ///         day-to-day operational call. Ops topup is a direct
+    ///         `LINK.transfer(resolver, amount)` from the funding wallet
+    ///         — no on-contract call needed.
+    function withdrawLink(uint256 amount) external onlyOwner {
+        linkToken.safeTransfer(msg.sender, amount);
+        emit LinkWithdrawn(msg.sender, amount);
     }
 
     function setAuthorizedCaller(address caller, bool authorized) external onlyOwner {
@@ -123,22 +240,52 @@ contract ChainlinkResolver is Ownable {
         return _getLatestPrice(pairId);
     }
 
-    // ── Public: permissionless roundId-bound resolution ─────────────────
-    /// @notice Resolve `marketId` using the Chainlink round identified by
-    ///         `roundId`. The contract verifies `roundId` is the *canonical*
-    ///         round for the market — i.e. the latest round whose `updatedAt`
-    ///         is `<= market.endTime`, with the next round strictly after.
-    ///         This is permissionless: anyone can call, but only the canonical
-    ///         `roundId` will succeed, eliminating the race-to-resolve attack
-    ///         that existed under the old `latestRoundData` semantics.
-    /// @dev    PR-10 (P0-16). Off-chain helpers (see backend
-    ///         `ChainlinkResolverService`) compute the canonical round and
-    ///         submit it; on-chain we re-derive the constraints rather than
-    ///         trust the caller. `_isStale(updatedAt)` (via MAX_STALENESS) is
-    ///         still applied so a feed gap that places the canonical round far
-    ///         in the past clamps rather than silently resolves on an ancient
-    ///         price.
-    function resolve(uint256 marketId, uint80 roundId) external {
+    // ── Public: Data Streams report-bound resolution ─────────────────────
+    //
+    // 2026-05-13 Data Streams swap (gate 1):
+    //
+    // Pre-swap (PR-10 / P0-16): the resolver consumed Chainlink Data Feeds
+    // via `AggregatorV3Interface.getRoundData(roundId)`, with the off-chain
+    // helper computing the canonical round whose `updatedAt <= endTime` and
+    // whose `roundId + 1` postdates `endTime`. That model required scanning
+    // round history on-chain (two `getRoundData` calls per resolve), suffered
+    // a 1h `MAX_STALENESS` cliff that caused the 2026-05-06 shadow-market
+    // class (`audit-fixes/AUDIT_FINDING_CHECKUPKEEP_GAS_LEAK.md`), and was
+    // structurally limited by Data Feeds' heartbeat-driven publishing.
+    //
+    // Post-swap: the resolver consumes Chainlink Data Streams. The off-chain
+    // `ChainlinkResolverService` fetches a signed `ReportV3` blob from the
+    // Streams REST API (`api.dataengine.chain.link/api/v1/reports`) at the
+    // market's `endTime` and submits it as `signedReport` calldata. The
+    // resolver:
+    //
+    //   1. Validates market state (registered, not resolved, past endTime).
+    //   2. Checks the sequencer (same Arbitrum L2 pattern as before).
+    //   3. Looks up the per-pair Streams feed-id from `streamsFeedId`.
+    //   4. Pays the LINK fee to the FeeManager (when configured) — Option A
+    //      funding model: resolver holds its own LINK balance.
+    //   5. Calls `verifierProxy.verify(signedReport, parameterPayload)`. The
+    //      proxy validates the DON signature, deducts the fee, and returns
+    //      the decoded report.
+    //   6. Decodes as `ReportV3`. Validates feedId match, expiresAt, and
+    //      that `observationsTimestamp` is within the
+    //      `[endTime - MAX_REPORT_OBSERVATION_LAG, endTime]` bracket.
+    //   7. Computes winningOption from `report.price` vs `info.strikePrice`.
+    //   8. Hands off to `settlement.resolve` under the same try/catch
+    //      pattern as before — `ResolveFailed` event preserves the
+    //      auditable failure path.
+    //
+    // Permissionless and deterministic: any caller can submit any signed
+    // report, but only a report (a) for the right pair, (b) within the
+    // observation window, (c) not expired, and (d) signed by the DON will
+    // produce a successful resolve. Different reports observed within the
+    // 30s window yield ~identical prices for sub-second Crypto streams, so
+    // the determinism property is preserved in practice; the bracket is
+    // tight enough to prevent meaningful price manipulation. See
+    // `audit-fixes/DATA_STREAMS_INVESTIGATION.md` for the full design
+    // rationale.
+
+    function resolve(uint256 marketId, bytes calldata signedReport) external {
         MarketInfo storage info = markets[marketId];
         if (info.settlement == address(0)) revert MarketNotRegistered();
         if (info.resolved) revert AlreadyResolved();
@@ -148,30 +295,39 @@ contract ChainlinkResolver is Ownable {
 
         _checkSequencer();
 
-        // ── Roundtrip: pull the supplied round and the next round, verify
-        //    canonicality, then use the supplied round's `answer` as the
-        //    settlement price. ───────────────────────────────────────────
-        address feed = priceFeeds[info.pairId];
-        if (feed == address(0)) revert FeedNotConfigured();
+        bytes32 wantFeedId = streamsFeedId[info.pairId];
+        if (wantFeedId == bytes32(0)) revert StreamsFeedNotConfigured();
 
-        AggregatorV3Interface aggregator = AggregatorV3Interface(feed);
+        // Pay the LINK fee + verify. The FeeManager is the source of
+        // truth for the exact fee amount, the LINK token address, and the
+        // RewardManager to approve. When the FeeManager is unset (testnet
+        // or subscription-billed mainnets), `parameterPayload` is empty
+        // and `verify` proceeds without a fee deduction.
+        bytes memory parameterPayload = _payVerificationFee(signedReport);
+        bytes memory verifierResponse = verifierProxy.verify(signedReport, parameterPayload);
 
-        (, int256 settlementPrice,, uint256 updatedAt,) = aggregator.getRoundData(roundId);
-        if (updatedAt > uint256(m.endTime)) revert RoundTooLate();
+        // Crypto streams (BTC/USD, ETH/USD) always decode as V3. If we
+        // ever add RWA pairs (V8), branch here on a stream-id → schema
+        // mapping. Not needed in v1; flagged for v1.1.
+        ReportV3 memory report = abi.decode(verifierResponse, (ReportV3));
 
-        // Existing MAX_STALENESS guard — still meaningful because the
-        // *canonical* round can itself be ancient if the feed is gapped
-        // (e.g. the resolver runs days after endTime on a stalled feed).
-        if (block.timestamp - updatedAt > MAX_STALENESS) revert StalePrice();
+        if (report.feedId != wantFeedId) revert ReportFeedIdMismatch(wantFeedId, report.feedId);
+        if (uint256(report.expiresAt) < block.timestamp) {
+            revert ReportExpired(uint256(report.expiresAt), block.timestamp);
+        }
 
-        // The next round MUST postdate endTime — proves the caller picked
-        // the LAST pre-endTime round, not just any earlier one. If the
-        // round is missing (some Chainlink feeds may revert for unknown
-        // ids) `getRoundData` reverts and the call fails closed, which
-        // is the safe default.
-        (, , , uint256 nextUpdatedAt,) = aggregator.getRoundData(roundId + 1);
-        if (nextUpdatedAt <= uint256(m.endTime)) revert NotLastPreEndTimeRound();
+        // Observation window: `endTime - LAG <= observationsTimestamp <= endTime`.
+        // Upper bound (== endTime) rejects post-close observations that
+        // would price the market on a snapshot after it closed. Lower
+        // bound rejects reports too old to be representative of the
+        // close — caller should fetch a fresher one from the API.
+        uint256 obs = uint256(report.observationsTimestamp);
+        uint256 endTs = uint256(m.endTime);
+        if (obs > endTs || obs + MAX_REPORT_OBSERVATION_LAG < endTs) {
+            revert ReportObservationOutOfWindow(endTs, obs);
+        }
 
+        int256 settlementPrice = int256(report.price);
         uint256 winningOption = settlementPrice > info.strikePrice ? OPTION_UP : OPTION_DOWN;
 
         try IUpDownSettlement(info.settlement).resolve(marketId, settlementPrice, uint8(winningOption)) {
@@ -183,6 +339,50 @@ contract ChainlinkResolver is Ownable {
             // instead of in off-chain reconciliation logs only.
             emit ResolveFailed(marketId, settlementPrice, reason);
         }
+    }
+
+    /// @dev Pay the LINK verification fee, returning the `parameterPayload`
+    ///      to pass to `verifierProxy.verify`. Encapsulates the FeeManager
+    ///      lookup + approve dance so the main `resolve` flow stays linear.
+    function _payVerificationFee(bytes calldata signedReport)
+        internal
+        returns (bytes memory parameterPayload)
+    {
+        address feeManagerAddr = verifierProxy.s_feeManager();
+        if (feeManagerAddr == address(0)) {
+            // Testnet / subscription-billed deployment — no fee path.
+            return bytes("");
+        }
+        IFeeManager feeManager = IFeeManager(feeManagerAddr);
+        address feeToken = feeManager.i_linkAddress();
+        // Cross-check: the LINK token reported by the FeeManager must
+        // match the one this resolver was deployed against. A mismatch
+        // means we'd approve a token we don't hold — fail loudly.
+        require(feeToken == address(linkToken), "FeeManager LINK mismatch");
+
+        // The unverified report payload format wraps the report data in
+        // a header. `getFeeAndReward` expects the inner report bytes,
+        // which the reference implementation extracts as the second
+        // element of `(bytes32[3], bytes)`. Pass the full payload here
+        // and let the FeeManager handle extraction internally — the
+        // reference contract passes `reportData` (the inner bytes), but
+        // matching the docs' tutorial flow exactly.
+        (, bytes memory reportData) = abi.decode(signedReport, (bytes32[3], bytes));
+        (FeeManagerAsset memory fee, , ) = feeManager.getFeeAndReward(address(this), reportData, feeToken);
+
+        if (fee.amount > 0) {
+            address rewardManager = feeManager.i_rewardManager();
+            // SafeERC20 approve to a known FeeManager-blessed recipient.
+            // `forceApprove` would be safer for tokens that don't allow
+            // setting a new non-zero allowance without a 0-reset, but
+            // LINK is OpenZeppelin-compliant so `safeIncreaseAllowance`
+            // / `approve` work cleanly here. We use the plain `approve`
+            // because the FeeManager pulls and we want exact-amount
+            // semantics, not allowance accumulation.
+            linkToken.forceApprove(rewardManager, fee.amount);
+        }
+
+        parameterPayload = abi.encode(feeToken);
     }
 
     // ── Internal helpers ────────────────────────────────────────────────
