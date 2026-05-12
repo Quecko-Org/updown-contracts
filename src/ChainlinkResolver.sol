@@ -387,9 +387,17 @@ contract ChainlinkResolver is Ownable {
 
     // ── Internal helpers ────────────────────────────────────────────────
     function _checkSequencer() internal view {
-        (, int256 answer,, uint256 startedAt,) = sequencerFeed.latestRoundData();
+        // F-12 (deep review, surfaced by Streams Gate 3 Sepolia E2E 2026-05-12):
+        // the destructure pattern `(, A,, B,)` reads positions 1 (`answer`) and
+        // 3 (`updatedAt`) from `latestRoundData() returns (roundId, answer,
+        // startedAt, updatedAt, answeredInRound)`. The local variable below is
+        // therefore the feed's `updatedAt`, NOT its `startedAt`. Renamed for
+        // honesty; on-mainnet behavior against Chainlink's Sequencer Uptime
+        // feed is unchanged because that feed only writes a new round on
+        // state transitions, making `startedAt == updatedAt` in steady state.
+        (, int256 answer,, uint256 updatedAt,) = sequencerFeed.latestRoundData();
         if (answer != 0) revert SequencerDown();
-        if (block.timestamp - startedAt < SEQUENCER_GRACE_PERIOD) revert SequencerGracePeriod();
+        if (block.timestamp - updatedAt < SEQUENCER_GRACE_PERIOD) revert SequencerGracePeriod();
     }
 
     function _getLatestPrice(bytes32 pairId) internal view returns (int256) {
