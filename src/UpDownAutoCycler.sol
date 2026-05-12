@@ -17,10 +17,79 @@ contract UpDownAutoCycler is Ownable {
     // ── Errors ──────────────────────────────────────────────────────────
     error InvalidTimeframeIndex();
     error PreStartWindowTooLarge();
+    /// @notice F-04 complement: zero-address at construction would brick the
+    ///         cycler permanently because `resolver`/`settlement` are
+    ///         immutable. Symmetric with `ChainlinkResolver.ZeroTrustedSettlement`.
+    error ZeroAddress();
+    /// @notice F-02 (deep review 2026-05-11): a slot's `plannedStart + duration`
+    ///         is already more than `RESOLVER_MAX_STALENESS` behind
+    ///         `block.timestamp`. The resolver's Chainlink staleness check
+    ///         (`ChainlinkResolver.MAX_STALENESS`) would reject any resolve
+    ///         attempt on this market with `StalePrice()`, so we refuse to
+    ///         create it. Closes the catch-up shadow-market class structurally.
+    error PlannedStartTooStale(uint256 plannedStart, uint256 plannedEnd, uint256 nowTs);
+    /// @notice F-06 part 1 (deep review 2026-05-11): the strike returned by
+    ///         `resolver.getPrice` doesn't fit in `int128`. The settlement
+    ///         stores `strikePrice` as `int128`; a silent downcast there
+    ///         followed by the resolver's `int256(sm.strikePrice) != strikePrice`
+    ///         consistency check at `registerMarket` would cascade into a
+    ///         `MarketNotRegistered()` revert. Range-check loudly here
+    ///         instead. Unreachable for BTC/USD at 8 decimals today; matters
+    ///         for any future pair with a higher-decimal or larger-magnitude feed.
+    error StrikeOverflow(int256 strike);
+    /// @notice #21 (POST_DEMO_TODO 2026-05-06, deep-review companion to F-02):
+    ///         caller of `evictUnresolved` named a marketId that is not
+    ///         currently in `_activeMarkets[]`. Either already pruned, never
+    ///         created on this cycler, or wrong cycler.
+    error MarketNotInActiveSet(uint256 marketId);
+    /// @notice #21: caller of `evictUnresolved` named a market that is still
+    ///         within the resolver's `MAX_STALENESS` window — i.e. the
+    ///         permissionless `ChainlinkResolver.resolve` call could still
+    ///         succeed for this market. Admin eviction is gated to provably
+    ///         unresolvable markets to avoid an admin-mistake user-funds-locking
+    ///         class of bug. Wait until `endTime + RESOLVER_MAX_STALENESS <
+    ///         block.timestamp` or call `pruneResolved()` if the market has
+    ///         already been resolved off-cycler.
+    error MarketStillResolvable(uint256 marketId, uint256 endTime, uint256 nowTs);
+    /// @notice F-01 (deep review 2026-05-11): keeper invoked `performUpkeep`
+    ///         on this cycler after it was deprecated. Converts the
+    ///         "silent burn on orphaned cycler after a redeploy" failure
+    ///         mode (PR #88 generalization) into a loud revert so any
+    ///         keeper still pointed at the old address sees its txes
+    ///         revert and alerts. `checkUpkeep` returns `(false, "")`
+    ///         silently when deprecated — only on-chain writes revert
+    ///         loudly.
+    error Deprecated();
+    /// @notice F-01: `deprecate(address)` is a one-shot — calling twice is
+    ///         an operator mistake worth surfacing rather than silently
+    ///         no-op'ing. The replacement-address record from the first
+    ///         call stays canonical.
+    error AlreadyDeprecated();
 
     // ── Events ──────────────────────────────────────────────────────────
     event MarketCreated(uint256 indexed marketId, bytes32 indexed pairId, uint256 duration, int256 strikePrice);
     event MarketCreationFailed(bytes32 indexed pairId, uint256 indexed timeframe, bytes reason);
+    /// @notice F-06 part 2 (deep review 2026-05-11): emitted alongside
+    ///         `MarketCreationFailed` when the catch block in `performUpkeep`
+    ///         advances `pairTfLastCreated` so the failed slot does not get
+    ///         retried indefinitely. `skippedSlotStart` is the value that
+    ///         `pairTfLastCreated[pairId][tfIdx]` was set to (= the
+    ///         plannedStart that the failed `_createMarket` would have used).
+    ///         Off-chain consumers can audit fail-forward gaps by indexing
+    ///         this event in tandem with `MarketCreationFailed`.
+    event SlotSkippedAfterFailure(bytes32 indexed pairId, uint256 indexed tfIdx, uint256 skippedSlotStart);
+    /// @notice #21: emitted when the owner manually evicts a stuck market
+    ///         from `_activeMarkets[]`. Ops audit trail for the admin
+    ///         escape hatch. Sister event to `MarketCreationFailed` /
+    ///         `SlotSkippedAfterFailure` — together these three events let
+    ///         off-chain consumers reconstruct the lifecycle of every slot.
+    event SlotEvictedManually(uint256 indexed marketId, bytes32 indexed pairId, uint256 endTime);
+    /// @notice F-01 (deep review 2026-05-11): emitted on `deprecate()`.
+    ///         `replacement` is the new cycler address operators are
+    ///         migrating to, or `address(0)` if the deprecation is a
+    ///         final shutdown with no replacement (winding down).
+    ///         Off-chain indexers track rotations by following this event.
+    event CyclerDeprecated(address indexed oldCycler, address indexed replacement);
     event ResolutionFailed(uint256 indexed marketId, bytes reason);
     event TimeframeToggled(uint256 indexed index, bool active);
     event FundsWithdrawn(address indexed token, uint256 amount);
@@ -52,10 +121,25 @@ contract UpDownAutoCycler is Ownable {
     bytes32 public constant BTCUSD = keccak256("BTC/USD");
     bytes32 public constant ETHUSD = keccak256("ETH/USD");
     uint256 public constant NUM_TIMEFRAMES = 3;
+    /// @notice Mirrors `ChainlinkResolver.MAX_STALENESS` (1 hour). Duplicated
+    ///         here so `_createMarket`'s F-02 freshness guard can short-circuit
+    ///         without an external SLOAD per call. The cycler + resolver
+    ///         deploy as a bundle; if `MAX_STALENESS` ever changes in the
+    ///         resolver, this constant must change in lockstep. Reviewed in
+    ///         the same audit pass to catch divergence.
+    uint256 public constant RESOLVER_MAX_STALENESS = 1 hours;
 
     // ── State ───────────────────────────────────────────────────────────
-    ChainlinkResolver public resolver;
-    IUpDownSettlement public settlement;
+    /// @notice F-04 (deep review 2026-05-11): both pointers are `immutable`.
+    ///         Symmetric with `ChainlinkResolver.trustedSettlement` (also
+    ///         immutable). Rotation of either contract requires a full
+    ///         redeployment of the cycler — by design. The deploy unit is the
+    ///         three-contract bundle (settlement + resolver + cycler); a
+    ///         mid-life pointer rotation could orphan unresolved entries in
+    ///         `_activeMarkets[]` and permanently lock user positions. See
+    ///         the F-04 section of the deep-review doc for the full mechanism.
+    ChainlinkResolver public immutable resolver;
+    IUpDownSettlement public immutable settlement;
 
     TimeframeConfig[NUM_TIMEFRAMES] public timeframes;
     ActiveMarket[] internal _activeMarkets;
@@ -87,8 +171,20 @@ contract UpDownAutoCycler is Ownable {
     uint256 public preStartWindowSec;
     uint256 public constant PRE_START_WINDOW_MAX = 300;
 
+    /// @notice F-01 (deep review 2026-05-11): one-shot deprecation marker.
+    ///         When `true`, this cycler signals "do not drive me" to all
+    ///         keepers: `checkUpkeep` returns `(false, "")` so Chainlink
+    ///         Automation stops scheduling, and `performUpkeep` reverts
+    ///         with `Deprecated()` so any keeper still pointed at this
+    ///         address sees broadcast failures and alerts. Set by
+    ///         `deprecate(address replacement)` (one-shot). The
+    ///         replacement-cycler address is recorded in the
+    ///         `CyclerDeprecated` event for off-chain indexers.
+    bool public deprecated;
+
     // ── Constructor ─────────────────────────────────────────────────────
     constructor(address _owner, address _resolver, address _settlement) Ownable(_owner) {
+        if (_resolver == address(0) || _settlement == address(0)) revert ZeroAddress();
         resolver = ChainlinkResolver(_resolver);
         settlement = IUpDownSettlement(_settlement);
 
@@ -133,6 +229,13 @@ contract UpDownAutoCycler is Ownable {
     ///         + tf.duration`. Reduces to today's behavior (`>= pairTfLastCreated
     ///         + tf.duration`) when `preStartWindowSec == 0`.
     function checkUpkeep(bytes calldata) external view returns (bool upkeepNeeded, bytes memory performData) {
+        // F-01: silent short-circuit when deprecated. Chainlink Automation
+        // polls `checkUpkeep`; returning `(false, "")` tells it nothing is
+        // pending and it stops scheduling perform calls. No event emitted —
+        // the `CyclerDeprecated` event from `deprecate()` already records
+        // the lifecycle transition.
+        if (deprecated) return (false, "");
+
         uint256 marketsLen = _activeMarkets.length;
         uint256 preWin = preStartWindowSec;
 
@@ -154,7 +257,23 @@ contract UpDownAutoCycler is Ownable {
             }
         }
 
-        upkeepNeeded = resolveCount > 0 || createCount > 0;
+        // Prior #2 (AUDIT_FINDING_CHECKUPKEEP_GAS_LEAK.md, 2026-05-07):
+        // `upkeepNeeded` is gated on `createCount > 0` only — `resolveCount`
+        // is kept for diagnostic emission in `performData` but does NOT
+        // trigger keeper work. Resolution is off-chain (PR-10 / P0-16); this
+        // contract's `performUpkeep` ignores `resolveIndices`. Pre-fix,
+        // every past-endTime market in `_activeMarkets[]` made `checkUpkeep`
+        // return `true` on every block, burning ~2M gas per call on a
+        // `_pruneResolved` walk that pops nothing (because resolution is
+        // async and shadow markets per F-02/StalePrice never resolve). At
+        // Chainlink Automation cadence on Arbitrum (~250ms blocks), that's
+        // ~$200-500/day in LINK billed against the upkeep registration for
+        // unproductive walks. Gating on `createCount > 0` reduces the keeper
+        // to "fire only when there's actual on-chain work to do" — pruning
+        // happens naturally at create cadence (every 5 min in normal
+        // operation), which is more than sufficient for a healthy
+        // `_activeMarkets[]` lifecycle.
+        upkeepNeeded = createCount > 0;
 
         if (upkeepNeeded) {
             uint256[] memory resolveIndices = new uint256[](resolveCount);
@@ -192,6 +311,15 @@ contract UpDownAutoCycler is Ownable {
     ///         `performData` (still emitted by `checkUpkeep`) so a future
     ///         redesign can read it, but `performUpkeep` ignores it today.
     function performUpkeep(bytes calldata performData) external {
+        // F-01: loud revert when deprecated. Pairs with the silent
+        // `checkUpkeep` return — Chainlink Automation should never call
+        // `performUpkeep` on a deprecated cycler (because `checkUpkeep`
+        // returns `false`), but a misconfigured external keeper (the
+        // PR #88 footgun: hardcoded stale cycler address) could still
+        // call `performUpkeep` directly. The revert converts that silent
+        // burn into a loud failure the keeper operator notices.
+        if (deprecated) revert Deprecated();
+
         // `resolveIndices` is decoded for ABI/payload stability with the
         // Chainlink Automation registration but not iterated here because
         // resolution is roundId-bound and lives off-chain.
@@ -202,6 +330,38 @@ contract UpDownAutoCycler is Ownable {
         for (uint256 i; i < createSlots.length; ++i) {
             CreateSlot memory slot = createSlots[i];
             try this._createMarketExternal(slot.tfIdx, slot.pairId) {} catch (bytes memory reason) {
+                // F-06 part 2 (fail-forward): advance `pairTfLastCreated` so
+                // the next `checkUpkeep` doesn't re-flag this same failed
+                // slot. The failed slot becomes a permanent gap; the
+                // `MarketCreationFailed` + `SlotSkippedAfterFailure` events
+                // carry pairId + tfIdx + raw revert reason so ops can audit
+                // every gap. Loud-and-permanent beats stuck-and-silent.
+                //
+                // Two callers can land here: the F-02 freshness guard
+                // (catch-up catch-up burns one slot at a time) and any other
+                // revert inside `_createMarket` (strike overflow per F-06
+                // part 1, registerMarket consistency mismatch, an externally
+                // unavailable resolver, etc.). The advancement semantic is
+                // identical: skip this slot, retry the next one.
+                //
+                // Defensive guard on `slot.tfIdx`: `checkUpkeep` only emits
+                // valid tfIdx (< NUM_TIMEFRAMES), but `performUpkeep` is
+                // external — a hand-crafted `performData` could pass an
+                // out-of-range tfIdx that already caused _createMarket to
+                // revert with InvalidTimeframeIndex. In that case, indexing
+                // `timeframes[slot.tfIdx]` below would itself revert,
+                // turning the catch into a second revert. Skip the
+                // advancement for invalid tfIdx — emit the failure event
+                // only.
+                if (slot.tfIdx < NUM_TIMEFRAMES) {
+                    TimeframeConfig storage tft = timeframes[slot.tfIdx];
+                    uint256 lastStart = pairTfLastCreated[slot.pairId][slot.tfIdx];
+                    uint256 skippedSlotStart = lastStart == 0
+                        ? (block.timestamp / tft.duration) * tft.duration
+                        : lastStart + tft.duration;
+                    pairTfLastCreated[slot.pairId][slot.tfIdx] = skippedSlotStart;
+                    emit SlotSkippedAfterFailure(slot.pairId, slot.tfIdx, skippedSlotStart);
+                }
                 emit MarketCreationFailed(slot.pairId, slot.tfIdx, reason);
             }
         }
@@ -234,8 +394,6 @@ contract UpDownAutoCycler is Ownable {
 
         TimeframeConfig storage tf = timeframes[tfIdx];
 
-        int256 strike = resolver.getPrice(pairId);
-
         uint256 nowTs = block.timestamp;
         uint256 lastStart = pairTfLastCreated[pairId][tfIdx];
         uint256 plannedStart;
@@ -247,6 +405,41 @@ contract UpDownAutoCycler is Ownable {
             plannedStart = lastStart + tf.duration;
         }
         uint256 end = plannedStart + tf.duration;
+
+        // F-02: refuse to create a market whose `end` is already more than
+        // RESOLVER_MAX_STALENESS behind `nowTs`. The resolver's
+        // `MAX_STALENESS` (1h) bounds the latest moment a Chainlink round
+        // can be considered fresh for resolution. A slot whose `end` is
+        // already > 1h in the past can never be resolved cleanly — it
+        // would revert `ChainlinkResolver.StalePrice()` and accumulate
+        // in `_activeMarkets[]` forever (cf. POST_DEMO_TODO #21 evictUnresolved).
+        //
+        // The check fires BEFORE the strike fetch + external calls so a
+        // stale catch-up cycle exits cheaply. The cycler skips the slot
+        // here, and `performUpkeep`'s catch block advances
+        // `pairTfLastCreated` (F-06 fail-forward) so the next tick moves
+        // to the following slot instead of retrying the same stale one.
+        if (end + RESOLVER_MAX_STALENESS < nowTs) {
+            // The literal check is on `end + MAX_STALENESS < nowTs` (end-of-slot
+            // staleness); the error is named `PlannedStartTooStale` for the
+            // semantic of "the planned start is past usefulness," which is the
+            // operator-facing interpretation. Don't rename — propagation churn.
+            revert PlannedStartTooStale(plannedStart, end, nowTs);
+        }
+
+        int256 strike = resolver.getPrice(pairId);
+
+        // F-06 part 1: int128 range check. The settlement casts `strike` to
+        // `int128` for storage (`UpDownSettlement._createMarket` line 262).
+        // Without this guard, a too-large strike would truncate silently in
+        // settlement, then fail `resolver.registerMarket`'s consistency check
+        // (`int256(sm.strikePrice) != strikePrice`) below, cascading into a
+        // catch block that — pre-F-06-part-2 — would stick the same slot
+        // forever. Range-check loudly here; the failure mode becomes a loud,
+        // single-call revert with the offending value preserved in the error.
+        if (strike > type(int128).max || strike < type(int128).min) {
+            revert StrikeOverflow(strike);
+        }
 
         uint256 marketId = settlement.createMarket(pairId, tf.duration, strike, uint64(plannedStart), uint64(end));
 
@@ -287,12 +480,28 @@ contract UpDownAutoCycler is Ownable {
         }
     }
 
-    function setResolver(address _resolver) external onlyOwner {
-        resolver = ChainlinkResolver(_resolver);
-    }
+    // F-04 (deep review 2026-05-11): `setResolver` and `setSettlement` removed.
+    // Both pointers are `immutable`, set once in the constructor. Rotation
+    // requires a full bundle redeploy (settlement + resolver + cycler). See
+    // the immutables' docstring above and the F-04 section of the deep-review
+    // doc for the user-funds-locking mechanism this prevents.
 
-    function setSettlement(address _settlement) external onlyOwner {
-        settlement = IUpDownSettlement(_settlement);
+    /// @notice F-01 (deep review 2026-05-11): one-shot deprecation. Flips
+    ///         the `deprecated` state so any subsequent `checkUpkeep` returns
+    ///         `(false, "")` and any direct `performUpkeep` call reverts
+    ///         with `Deprecated()`. Use this between deploys to fence off
+    ///         the old cycler from accepting keeper work (closes the PR #88
+    ///         "obsolete-cycler keeper bleed" class at the contract level).
+    ///
+    /// @param replacement Address of the cycler operators are migrating to,
+    ///        or `address(0)` if this is a final shutdown with no successor.
+    ///        Recorded in the `CyclerDeprecated` event for off-chain
+    ///        indexers — not enforced or stored on-chain (no reason to;
+    ///        the value is informational).
+    function deprecate(address replacement) external onlyOwner {
+        if (deprecated) revert AlreadyDeprecated();
+        deprecated = true;
+        emit CyclerDeprecated(address(this), replacement);
     }
 
     // ── Owner: fund management ──────────────────────────────────────────
@@ -320,6 +529,67 @@ contract UpDownAutoCycler is Ownable {
             } else {
                 ++i;
             }
+        }
+    }
+
+    /// @notice #21 (POST_DEMO_TODO 2026-05-06): admin escape hatch for
+    ///         markets stuck in `_activeMarkets[]` because they passed the
+    ///         resolver's `MAX_STALENESS` window before
+    ///         `ChainlinkResolver.resolve` could complete (catch-up shadows,
+    ///         resolver outages crossing the staleness boundary, etc.).
+    ///         F-02's `_createMarket` freshness guard prevents NEW shadows
+    ///         on this cycler; `evictUnresolved` is the defense-in-depth
+    ///         cleanup hatch for any that slip through (e.g., resolver
+    ///         transiently unavailable across the staleness boundary AFTER
+    ///         a market was successfully created).
+    ///
+    ///         Safety: only allows eviction of markets whose
+    ///         `endTime + RESOLVER_MAX_STALENESS < block.timestamp`. This
+    ///         is the same provably-unresolvable condition F-02 uses to
+    ///         REFUSE creation. Markets within the staleness window are
+    ///         still resolvable via the permissionless
+    ///         `ChainlinkResolver.resolve` and admin must not be able to
+    ///         force-evict them (that would lock user funds in those
+    ///         markets — the same hazard F-04 closes for resolver/settlement
+    ///         pointer rotation).
+    ///
+    ///         Eviction touches ONLY the cycler's `_activeMarkets[]` index.
+    ///         The settlement contract's per-market state
+    ///         (`settlement.markets[id]`) is left intact — eviction is a
+    ///         bookkeeping cleanup, not a market-state mutation.
+    ///
+    ///         Callers pass marketIds directly; F-11 (no per-pair index)
+    ///         leaves the responsibility of finding stuck IDs to off-chain
+    ///         scans of `SlotSkippedAfterFailure` + market endTimes.
+    function evictUnresolved(uint256[] calldata marketIds) external onlyOwner {
+        uint256 nowTs = block.timestamp;
+        for (uint256 idx; idx < marketIds.length; ++idx) {
+            uint256 mid = marketIds[idx];
+
+            // Linear scan — `_activeMarkets[]` size is bounded by
+            // (timeframes × pairs × pending-resolve-window) in normal ops
+            // (single digits to low hundreds). Per-pair index (F-11) is a
+            // future optimization if the array ever grows pathologically.
+            uint256 len = _activeMarkets.length;
+            uint256 found = type(uint256).max;
+            for (uint256 i; i < len; ++i) {
+                if (_activeMarkets[i].marketId == mid) {
+                    found = i;
+                    break;
+                }
+            }
+            if (found == type(uint256).max) revert MarketNotInActiveSet(mid);
+
+            ActiveMarket memory m = _activeMarkets[found];
+            if (m.endTime + RESOLVER_MAX_STALENESS >= nowTs) {
+                revert MarketStillResolvable(mid, m.endTime, nowTs);
+            }
+
+            // swap-and-pop
+            _activeMarkets[found] = _activeMarkets[len - 1];
+            _activeMarkets.pop();
+
+            emit SlotEvictedManually(mid, m.pairId, m.endTime);
         }
     }
 
